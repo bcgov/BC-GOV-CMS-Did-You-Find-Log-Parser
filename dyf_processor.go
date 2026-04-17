@@ -33,28 +33,25 @@ const (
 // ==============================
 
 type Settings struct {
-	LogDir              string
-	OutputDir           string
-	SearchTerms         []string
-	ProcessingMode      string
-	CleanAfter          bool
-	MaxMemoryMB         int
-	ChunkSize           int
-	LogLevel            string
-	ErrorFile           string
-	OutputFileName      string
-	OutputFormat        string
-	StrictURLMode       bool
-	AllowedHosts        []string
-	AllowedPathPrefixes []string
-
-	// New/updated behavior toggles
+	LogDir         string
+	OutputDir      string
+	WhiteList      [][]string // OR of AND groups: [[a,b],[c,d]] = (a AND b) OR (c AND d)
+	BlackList      [][]string
+	ProcessingMode string
+	CleanAfter     bool
+	ChunkSize      int
+	LogLevel       string
+	ErrorFile      string
+	OutputFileName string
+	OutputFormat   string
+	// Behavior toggles
 	ReconcileReason         bool
 	IncludeReasonRows       bool
 	ReasonLinkWindowSeconds int
 	SearchScope             string // "url" | "full_line"
 	SearchMode              string // "substring" | "word" | "regex"
 	SortOutput              bool
+	IncludeFileLineRef      bool
 }
 
 type Entry struct {
@@ -65,6 +62,9 @@ type Entry struct {
 	Reason       string
 	Timestamp    time.Time
 	Malformed    bool
+	Index        int64
+	FileName     string
+	LineNumber   int64
 }
 
 type ParquetRow struct {
@@ -74,6 +74,9 @@ type ParquetRow struct {
 	URL          string    `parquet:"url"`
 	Reason       string    `parquet:"reason"`
 	Timestamp    time.Time `parquet:"timestamp,logical=timestamp,unit=us"`
+	Index        int64     `parquet:"index"`
+	FileName     string    `parquet:"file_name"`
+	LineNumber   int64     `parquet:"line_number"`
 }
 
 var validResponseTypes = map[string]bool{
@@ -97,7 +100,6 @@ func main() {
 	}
 	fmt.Println("\nLoaded configuration:")
 	fmt.Printf("%+v\n", settings)
-
 	if err := processLogs(settings); err != nil {
 		fmt.Println("Processing error:", err)
 	}
@@ -112,7 +114,6 @@ func ensureConfig() {
 		fmt.Println("No config.ini found. Let's set up your configuration.")
 		reader := bufio.NewReader(os.Stdin)
 
-		// 1. Log Folder
 		fmt.Print("Enter the folder where log files are located (default: logs): ")
 		logDirInput, _ := reader.ReadString('\n')
 		logDir := strings.TrimSpace(logDirInput)
@@ -120,7 +121,6 @@ func ensureConfig() {
 			logDir = "logs"
 		}
 
-		// 2. Output Folder
 		fmt.Print("Enter the folder where processed output should be saved (default: output): ")
 		outDirInput, _ := reader.ReadString('\n')
 		outDir := strings.TrimSpace(outDirInput)
@@ -128,42 +128,52 @@ func ensureConfig() {
 			outDir = "output"
 		}
 
-		// 3. Search Terms
-		fmt.Print("Enter comma-separated search terms (leave blank for none): ")
-		termsInput, _ := reader.ReadString('\n')
-		terms := strings.TrimSpace(termsInput)
+		fmt.Print("Enter comma-separated white list terms (leave blank for none): ")
+		whiteInput, _ := reader.ReadString('\n')
+		white := strings.TrimSpace(whiteInput)
 
-		// Build full config file contents
 		content := fmt.Sprintf(`# Configuration file for Did-You-Find log processing
 [Paths]
 log_file_archive = %s
 output_directory = %s
 
 [Processing]
-search_terms = %s
+; white_list: URL must satisfy at least one group (leave blank to include all URLs)
+; black_list: URL is excluded if it satisfies any group (leave blank to exclude nothing)
+;
+; Syntax: use AND within a group, OR between groups, parentheses to define groups clearly.
+;   Single term:      white_list = taxes
+;   AND group:        white_list = (taxes AND /gov/content/taxes)
+;   Multiple groups:  white_list = (taxes AND /gov/content/taxes) OR (transportation AND cars)
+;   Black list:       black_list = (/test/) OR (/staging/)
+white_list = %s
+black_list =
 clean_after = True
-max_memory_mb = 1024
 chunk_size = 100000
 log_level = Info
 error_log_file = error_log.txt
-strict_url_mode = False
-allowed_hosts = www2.gov.bc.ca
-allowed_path_prefixes = /gov/content/
 
-; Safer defaults
+; Behavior toggles
 reconcile_reason = False
 include_reason_rows = True
 reason_link_window_seconds = 60
-search_scope = url
-search_mode = word
 
-; Sorting on by default
-sort_output = True
+; Search behavior (applies to both white_list and black_list)
+; search_scope: "url" matches only the URL; "full_line" matches the entire log line
+; search_mode:  "substring" | "word" | "regex"
+search_scope = url
+search_mode = substring
+
+; Sorting: False preserves original sequence; True sorts by url then index
+sort_output = False
+
+; Optional source references in output (CSV adds columns only when true; Parquet always has columns)
+include_file_line_ref = False
 
 [Output]
 output_file_name = Did-You-Find-Log
 output_format = csv
-`, logDir, outDir, terms)
+`, logDir, outDir, white)
 
 		err := os.WriteFile(ConfigFile, []byte(content), 0644)
 		if err != nil {
@@ -191,52 +201,44 @@ func loadConfig() (Settings, error) {
 		}
 		return ""
 	}
-
 	chunk, _ := strconv.Atoi(defaultIfEmpty(get("chunk_size"), "100000"))
-	maxMB, _ := strconv.Atoi(defaultIfEmpty(get("max_memory_mb"), "1024"))
 	clean := strings.ToLower(get("clean_after")) == "true"
-	strict := strings.ToLower(get("strict_url_mode")) == "true"
-	allowedHosts := splitComma(get("allowed_hosts"))
-	allowedPrefixes := splitComma(get("allowed_path_prefixes"))
 
-	// New flags with safe defaults
 	reconcile := strings.ToLower(get("reconcile_reason")) == "true"
-	includeReason := strings.ToLower(get("include_reason_rows")) != "false" // default true
+	includeReason := strings.ToLower(get("include_reason_rows")) != "false"
 	linkWindow, _ := strconv.Atoi(defaultIfEmpty(get("reason_link_window_seconds"), "60"))
 
 	searchScope := strings.ToLower(defaultIfEmpty(get("search_scope"), "url"))
 	if searchScope != "url" && searchScope != "full_line" {
 		searchScope = "url"
 	}
-	searchMode := strings.ToLower(defaultIfEmpty(get("search_mode"), "word"))
+	searchMode := strings.ToLower(defaultIfEmpty(get("search_mode"), "substring"))
 	if searchMode != "substring" && searchMode != "word" && searchMode != "regex" {
-		searchMode = "word"
+		searchMode = "substring"
 	}
 
-	sortOutput := strings.ToLower(defaultIfEmpty(get("sort_output"), "true")) == "true"
+	sortOutput := strings.ToLower(defaultIfEmpty(get("sort_output"), "false")) == "true"
+	includeFileLineRef := strings.ToLower(defaultIfEmpty(get("include_file_line_ref"), "false")) == "true"
 
 	return Settings{
-		LogDir:              get("log_file_archive"),
-		OutputDir:           get("output_directory"),
-		SearchTerms:         splitComma(get("search_terms")),
-		ProcessingMode:      strings.ToLower(get("processing_mode")),
-		CleanAfter:          clean,
-		MaxMemoryMB:         maxMB,
-		ChunkSize:           chunk,
-		LogLevel:            get("log_level"),
-		ErrorFile:           get("error_log_file"),
-		OutputFileName:      get("output_file_name"),
-		OutputFormat:        strings.ToLower(get("output_format")),
-		StrictURLMode:       strict,
-		AllowedHosts:        allowedHosts,
-		AllowedPathPrefixes: allowedPrefixes,
-
+		LogDir:                  get("log_file_archive"),
+		OutputDir:               get("output_directory"),
+		WhiteList:               parseFilterExpression(get("white_list")),
+		BlackList:               parseFilterExpression(get("black_list")),
+		ProcessingMode:          strings.ToLower(get("processing_mode")),
+		CleanAfter:              clean,
+		ChunkSize:               chunk,
+		LogLevel:                get("log_level"),
+		ErrorFile:               get("error_log_file"),
+		OutputFileName:          get("output_file_name"),
+		OutputFormat:            strings.ToLower(get("output_format")),
 		ReconcileReason:         reconcile,
 		IncludeReasonRows:       includeReason,
 		ReasonLinkWindowSeconds: linkWindow,
 		SearchScope:             searchScope,
 		SearchMode:              searchMode,
 		SortOutput:              sortOutput,
+		IncludeFileLineRef:      includeFileLineRef,
 	}, nil
 }
 
@@ -244,25 +246,22 @@ func loadConfig() (Settings, error) {
 // Parsing
 // ==============================
 
-func parseLine(line string, s Settings) Entry {
+func parseLine(line string) Entry {
 	parts := strings.Fields(line)
 	e := Entry{Malformed: false}
 	if len(parts) < 4 {
 		e.Malformed = true
 		return e
 	}
-
 	e.ResponseType = parts[0]
 	if !validResponseTypes[e.ResponseType] {
 		e.Malformed = true
 		return e
 	}
-
 	e.Date = parts[1]
 	e.Time = parts[2]
 
-	// Strict-capable normalization + validation
-	urlNorm, ok, reason := normalizeURL(parts[3], s)
+	urlNorm, ok, reason := normalizeURL(parts[3])
 	if !ok {
 		e.Malformed = true
 		e.Reason = reason
@@ -270,13 +269,11 @@ func parseLine(line string, s Settings) Entry {
 	}
 	e.URL = urlNorm
 
-	// Optional reason token (survey reason)
 	if len(parts) > 4 {
 		last := parts[len(parts)-1]
 		if validReasons[last] {
 			e.Reason = last
 		} else if e.ResponseType == "Reason" {
-			// Keep the row; just no canned reason recognized
 			e.Reason = ""
 		}
 	}
@@ -289,13 +286,11 @@ func parseLine(line string, s Settings) Entry {
 }
 
 // normalizeURL returns (normalizedURL, ok, reasonIfRejected)
-func normalizeURL(raw string, s Settings) (string, bool, string) {
+func normalizeURL(raw string) (string, bool, string) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", false, "EmptyOrInvalidURL"
 	}
-
-	// Remove query and fragment (canonicalize to path only)
 	if i := strings.IndexByte(raw, '?'); i >= 0 {
 		raw = raw[:i]
 	}
@@ -308,37 +303,21 @@ func normalizeURL(raw string, s Settings) (string, bool, string) {
 		return "", false, "EmptyOrInvalidURL"
 	}
 
-	// Prefer https in strict mode
-	if s.StrictURLMode {
-		if !strings.EqualFold(u.Scheme, "https") {
-			return "", false, "SchemeNotAllowed"
-		}
-	}
-
-	// Lowercase scheme and host
 	u.Scheme = strings.ToLower(u.Scheme)
 	u.Host = strings.ToLower(u.Host)
 
-	// Normalize path: collapse repeated slashes
 	path := u.EscapedPath()
-	needsCollapse := strings.Contains(path, "//")
 	path = collapseSlashes(path)
 
-	// Detect ellipsis / truncation (literal … or percent-encoded)
 	lp := strings.ToLower(path)
 	if strings.Contains(path, "…") || strings.Contains(lp, "%e2%80%a6") {
-		if s.StrictURLMode {
-			return "", false, "LikelyTruncated"
-		}
-		// relaxed mode: allow through
+		return "", false, "LikelyTruncated"
 	}
 
-	// Trim trailing slash, except root
 	if len(path) > 1 && strings.HasSuffix(path, "/") {
 		path = strings.TrimRight(path, "/")
 	}
 
-	// Validate UTF-8
 	if !utf8.ValidString(path) {
 		return "", false, "EmptyOrInvalidURL"
 	}
@@ -346,47 +325,6 @@ func normalizeURL(raw string, s Settings) (string, bool, string) {
 	u.Path = path
 	u.RawQuery = ""
 	u.Fragment = ""
-
-	// Host allowlist (strict)
-	if s.StrictURLMode && len(s.AllowedHosts) > 0 {
-		allowed := false
-		for _, h := range s.AllowedHosts {
-			if strings.EqualFold(u.Host, strings.TrimSpace(h)) {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			if strings.Contains(u.Host, "translate.goog") {
-				return "", false, "MachineTranslatedMirror"
-			}
-			return "", false, "HostNotAllowed"
-		}
-	}
-
-	// Path allowlist (strict) with boundary check
-	if s.StrictURLMode && len(s.AllowedPathPrefixes) > 0 {
-		allowed := false
-		lowerPath := strings.ToLower(u.Path)
-		for _, p := range s.AllowedPathPrefixes {
-			p = strings.TrimSpace(strings.ToLower(p))
-			if p == "" {
-				continue
-			}
-			if hasPathPrefix(lowerPath, p) {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return "", false, "PatternNotAllowed"
-		}
-	}
-
-	// If we had to collapse multiple slashes, choose strict policy
-	if needsCollapse && s.StrictURLMode {
-		return "", false, "MalformedPath"
-	}
 
 	return u.String(), true, ""
 }
@@ -412,51 +350,75 @@ func collapseSlashes(p string) string {
 	return b.String()
 }
 
-// hasPathPrefix ensures prefix matches on a segment boundary
-func hasPathPrefix(path, prefix string) bool {
-	if !strings.HasPrefix(path, prefix) {
-		return false
-	}
-	if len(path) == len(prefix) {
-		return true
-	}
-	return path[len(prefix)] == '/'
-}
-
 // ==============================
 // Matching / Filtering
 // ==============================
 
 type termMatcher func(entry Entry, rawLine string) bool
 
+// parseFilterExpression parses a white_list or black_list config value into OR-of-AND groups.
+// Syntax: (term1 AND term2) OR (term3 AND term4)
+// Parentheses are optional for single terms or single groups.
+// Returns [][]string where the outer slice is OR'd and each inner slice is AND'd.
+func parseFilterExpression(s string) [][]string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	var groups [][]string
+	for _, groupStr := range strings.Split(s, " OR ") {
+		groupStr = strings.TrimSpace(groupStr)
+		if strings.HasPrefix(groupStr, "(") && strings.HasSuffix(groupStr, ")") {
+			groupStr = groupStr[1 : len(groupStr)-1]
+		}
+		var terms []string
+		for _, term := range strings.Split(groupStr, " AND ") {
+			t := strings.TrimSpace(strings.ToLower(term))
+			if t != "" {
+				terms = append(terms, t)
+			}
+		}
+		if len(terms) > 0 {
+			groups = append(groups, terms)
+		}
+	}
+	return groups
+}
+
 func buildMatcher(s Settings) termMatcher {
-	terms := s.SearchTerms
-	if len(terms) == 0 {
-		return func(_ Entry, _ string) bool { return true } // no filtering
+	white := s.WhiteList
+	black := s.BlackList
+
+	if len(white) == 0 && len(black) == 0 {
+		return func(_ Entry, _ string) bool { return true }
 	}
 
 	switch s.SearchMode {
 	case "regex":
-		regs := make([]*regexp.Regexp, 0, len(terms))
-		for _, t := range terms {
-			r, err := regexp.Compile(t)
-			if err == nil {
-				regs = append(regs, r)
-			}
-		}
+		whiteRegGroups := compileRegexGroups(white)
+		blackRegGroups := compileRegexGroups(black)
 		return func(e Entry, raw string) bool {
 			target := raw
 			if s.SearchScope == "url" {
 				target = e.URL
 			}
 			lt := strings.ToLower(target)
-			for _, r := range regs {
-				if r.MatchString(lt) {
+			for _, group := range blackRegGroups {
+				if allRegexMatch(lt, group) {
+					return false
+				}
+			}
+			if len(whiteRegGroups) == 0 {
+				return true
+			}
+			for _, group := range whiteRegGroups {
+				if allRegexMatch(lt, group) {
 					return true
 				}
 			}
 			return false
 		}
+
 	case "word":
 		splitter := regexp.MustCompile(`[A-Za-z0-9_]+`)
 		return func(e Entry, raw string) bool {
@@ -466,17 +428,26 @@ func buildMatcher(s Settings) termMatcher {
 			}
 			lt := strings.ToLower(target)
 			tokens := splitter.FindAllString(lt, -1)
-			set := map[string]struct{}{}
+			set := make(map[string]struct{}, len(tokens))
 			for _, tk := range tokens {
 				set[tk] = struct{}{}
 			}
-			for _, t := range terms {
-				if _, ok := set[t]; ok {
+			for _, group := range black {
+				if allWordMatch(set, group) {
+					return false
+				}
+			}
+			if len(white) == 0 {
+				return true
+			}
+			for _, group := range white {
+				if allWordMatch(set, group) {
 					return true
 				}
 			}
 			return false
 		}
+
 	default: // "substring"
 		return func(e Entry, raw string) bool {
 			target := raw
@@ -484,14 +455,65 @@ func buildMatcher(s Settings) termMatcher {
 				target = e.URL
 			}
 			lt := strings.ToLower(target)
-			for _, t := range terms {
-				if strings.Contains(lt, t) {
+			for _, group := range black {
+				if allSubstringMatch(lt, group) {
+					return false
+				}
+			}
+			if len(white) == 0 {
+				return true
+			}
+			for _, group := range white {
+				if allSubstringMatch(lt, group) {
 					return true
 				}
 			}
 			return false
 		}
 	}
+}
+
+func allSubstringMatch(target string, terms []string) bool {
+	for _, t := range terms {
+		if !strings.Contains(target, t) {
+			return false
+		}
+	}
+	return true
+}
+
+func allWordMatch(set map[string]struct{}, terms []string) bool {
+	for _, t := range terms {
+		if _, ok := set[t]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func compileRegexGroups(groups [][]string) [][]*regexp.Regexp {
+	result := make([][]*regexp.Regexp, 0, len(groups))
+	for _, group := range groups {
+		var regs []*regexp.Regexp
+		for _, t := range group {
+			if r, err := regexp.Compile(t); err == nil {
+				regs = append(regs, r)
+			}
+		}
+		if len(regs) > 0 {
+			result = append(result, regs)
+		}
+	}
+	return result
+}
+
+func allRegexMatch(target string, regs []*regexp.Regexp) bool {
+	for _, r := range regs {
+		if !r.MatchString(target) {
+			return false
+		}
+	}
+	return true
 }
 
 // ==============================
@@ -505,11 +527,10 @@ func processLogLine(
 	s Settings,
 	errWriter *bufio.Writer,
 ) (*Entry, *Entry) {
-	entry := parseLine(line, s)
+	entry := parseLine(line)
 	original := strings.TrimSpace(line)
 
 	if entry.Malformed {
-		// Differentiate URL-based rejection from other malformed lines
 		if entry.Reason != "" {
 			errWriter.WriteString("URL_REJECTED (" + entry.Reason + "): " + original + "\n")
 		} else {
@@ -518,17 +539,14 @@ func processLogLine(
 		return nil, prev
 	}
 
-	// Filter now (respects search_scope/mode; default: URL only)
 	if !matcher(entry, line) {
 		return nil, prev
 	}
 
-	// Skip IFS
 	if entry.ResponseType == "IFS" {
 		return nil, prev
 	}
 
-	// OPTIONAL reconciliation (default OFF)
 	if s.ReconcileReason && entry.ResponseType == "Reason" && prev != nil && !prev.Malformed {
 		diff := entry.Timestamp.Sub(prev.Timestamp)
 		if abs(diff.Seconds()) <= float64(s.ReasonLinkWindowSeconds) && entry.URL == prev.URL {
@@ -542,7 +560,6 @@ func processLogLine(
 		}
 	}
 
-	// If not reconciling: keep Reason rows (unless IncludeReasonRows=false)
 	if entry.ResponseType == "Reason" && !s.IncludeReasonRows {
 		return nil, prev
 	}
@@ -555,15 +572,11 @@ func processLogLine(
 // ==============================
 
 func processLogs(s Settings) error {
-	// Ensure dirs
 	_ = os.MkdirAll(s.OutputDir, 0755)
-
 	outputPath := filepath.Join(s.OutputDir, fmt.Sprintf("%s.%s", s.OutputFileName, s.OutputFormat))
 	errorPath := filepath.Join(s.OutputDir, s.ErrorFile)
 
-	// If output file is missing, rebuild from scratch (even if processed_logs.txt exists)
 	outputMissing := !fileExists(outputPath)
-
 	var processed map[string]bool
 	var err error
 	if s.ProcessingMode == "overwrite" || outputMissing {
@@ -595,11 +608,13 @@ func processLogs(s Settings) error {
 	buffer := make([]Entry, 0, s.ChunkSize)
 	var parquetWriter *parquet.GenericWriter[ParquetRow]
 
-	// Build matcher once
 	matcher := buildMatcher(s)
+
+	var nextIndex int64 = 0
 
 	for fi, fname := range filesToProcess {
 		fmt.Printf("Processing file %d/%d: %s\n", fi+1, len(filesToProcess), fname)
+
 		filePath := filepath.Join(s.LogDir, fname)
 		f, ferr := os.Open(filePath)
 		if ferr != nil {
@@ -608,41 +623,64 @@ func processLogs(s Settings) error {
 		}
 
 		scanner := bufio.NewScanner(f)
-		// Increase scanner buffer to accommodate long lines/URLs
 		scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
 
 		var prev *Entry
+		var prevLineNumber int64 = 0
 		lineCount := 0
 		spinIndex := 0
 
 		for scanner.Scan() {
 			line := scanner.Text()
-			entryToAppend, newPrev := processLogLine(line, prev, matcher, s, bufErr)
 			lineCount++
-			if lineCount%5000 == 0 { // update ~every 5k lines
+			currentLineNumber := int64(lineCount)
+
+			entryToAppend, newPrev := processLogLine(line, prev, matcher, s, bufErr)
+
+			if lineCount%5000 == 0 {
 				fmt.Printf("\r[%c] %s — %d lines processed", spinner(spinIndex), fname, lineCount)
 				spinIndex++
 			}
+
 			if entryToAppend != nil {
+				entryToAppend.Index = nextIndex
+				nextIndex++
+				if s.IncludeFileLineRef {
+					entryToAppend.FileName = fname
+					entryToAppend.LineNumber = prevLineNumber
+				}
 				buffer = append(buffer, *entryToAppend)
 			}
+
+			prev = newPrev
+			if newPrev != nil {
+				prevLineNumber = currentLineNumber
+			} else {
+				prevLineNumber = 0
+			}
+
 			if len(buffer) >= s.ChunkSize {
 				parquetWriter, err = flushBuffer(buffer, s, outputPath, parquetWriter)
 				if err != nil {
+					_ = f.Close()
 					return err
 				}
 				buffer = buffer[:0]
 			}
-			prev = newPrev
 		}
 
-		// flush last entry for this file
 		if prev != nil {
+			prev.Index = nextIndex
+			nextIndex++
+			if s.IncludeFileLineRef {
+				prev.FileName = fname
+				prev.LineNumber = prevLineNumber
+			}
 			buffer = append(buffer, *prev)
 		}
 
-		// finalize display for this file
 		fmt.Printf("\r[✓] %s — %d lines processed\n", fname, lineCount)
+
 		_ = f.Close()
 		appendProcessedFile(fname)
 	}
@@ -666,7 +704,6 @@ func processLogs(s Settings) error {
 	if s.CleanAfter {
 		cleanOutput(outputPath, s.OutputFormat, s)
 	}
-
 	return nil
 }
 
@@ -680,7 +717,6 @@ func flushBuffer(
 	outputFile string,
 	gw *parquet.GenericWriter[ParquetRow],
 ) (*parquet.GenericWriter[ParquetRow], error) {
-	// Default to CSV if unexpected format
 	switch s.OutputFormat {
 	case "csv":
 		return writeCSV(buffer, s, outputFile)
@@ -698,24 +734,37 @@ func flushBuffer(
 
 func writeCSV(buffer []Entry, s Settings, outputPath string) (*parquet.GenericWriter[ParquetRow], error) {
 	exists := fileExists(outputPath)
+
 	f, err := os.OpenFile(outputPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, err
 	}
 	w := csv.NewWriter(f)
+
 	if !exists {
-		_ = w.Write([]string{"response_type", "date", "time", "url", "reason", "timestamp"})
+		base := []string{"response_type", "date", "time", "url", "reason", "timestamp", "index"}
+		if s.IncludeFileLineRef {
+			base = append(base, "file_name", "line_number")
+		}
+		_ = w.Write(base)
 	}
+
 	for _, e := range buffer {
-		_ = w.Write([]string{
+		row := []string{
 			e.ResponseType,
 			e.Date,
 			e.Time,
 			e.URL,
 			e.Reason,
 			e.Timestamp.Format(time.RFC3339Nano),
-		})
+			strconv.FormatInt(e.Index, 10),
+		}
+		if s.IncludeFileLineRef {
+			row = append(row, e.FileName, strconv.FormatInt(e.LineNumber, 10))
+		}
+		_ = w.Write(row)
 	}
+
 	w.Flush()
 	if err := w.Error(); err != nil {
 		_ = f.Close()
@@ -735,18 +784,15 @@ func writeParquet(
 	outputPath string,
 	gw *parquet.GenericWriter[ParquetRow],
 ) (*parquet.GenericWriter[ParquetRow], error) {
-	// Init on first write
 	if gw == nil {
 		f, err := os.Create(outputPath)
 		if err != nil {
 			return nil, err
 		}
-		// Keep the file handle open; parquet-go writer manages it
 		gw = parquet.NewGenericWriter[ParquetRow](f, parquet.Compression(&zstd.Codec{}))
-
 	}
 
-	// Write each row (you can batch if you prefer)
+	rows := make([]ParquetRow, 0, len(buffer))
 	for _, e := range buffer {
 		row := ParquetRow{
 			ResponseType: e.ResponseType,
@@ -755,10 +801,16 @@ func writeParquet(
 			URL:          e.URL,
 			Reason:       e.Reason,
 			Timestamp:    e.Timestamp,
+			Index:        e.Index,
 		}
-		if _, err := gw.Write([]ParquetRow{row}); err != nil {
-			return gw, err
+		if s.IncludeFileLineRef {
+			row.FileName = e.FileName
+			row.LineNumber = e.LineNumber
 		}
+		rows = append(rows, row)
+	}
+	if _, err := gw.Write(rows); err != nil {
+		return gw, err
 	}
 	return gw, nil
 }
@@ -802,32 +854,61 @@ func cleanCSV(path string, s Settings) error {
 
 	header := rows[0]
 	data := rows[1:]
-	seen := map[string]bool{}
-	uniq := make([][]string, 0, len(data))
+
+	hIdx := map[string]int{}
+	for i, name := range header {
+		hIdx[strings.ToLower(strings.TrimSpace(name))] = i
+	}
+	idxRT, ok1 := hIdx["response_type"]
+	idxDate, ok2 := hIdx["date"]
+	idxTime, ok3 := hIdx["time"]
+	idxURL, ok4 := hIdx["url"]
+	idxReason, ok5 := hIdx["reason"]
+	idxIndex, ok7 := hIdx["index"]
+
+	if !(ok1 && ok2 && ok3 && ok4 && ok5 && ok7) {
+		return fmt.Errorf("missing required columns in CSV header")
+	}
+
+	// Dedupe on (response_type, date, time, url, reason) — keep the lowest index
+	type dedupedRow struct {
+		row []string
+		idx int64
+	}
+	dedupeMap := make(map[string]dedupedRow, len(data))
 
 	for _, row := range data {
-		// dedupe key: response_type, date, time, url, reason
-		if len(row) < 6 {
+		if len(row) <= idxIndex {
 			continue
 		}
-		key := strings.Join(row[:5], "\n")
-		if !seen[key] {
-			seen[key] = true
-			uniq = append(uniq, row)
+		key := strings.Join([]string{
+			row[idxRT], row[idxDate], row[idxTime], row[idxURL], row[idxReason],
+		}, "\n")
+
+		idxVal, err := strconv.ParseInt(row[idxIndex], 10, 64)
+		if err != nil {
+			continue
+		}
+
+		if existing, ok := dedupeMap[key]; !ok || idxVal < existing.idx {
+			dedupeMap[key] = dedupedRow{row: row, idx: idxVal}
 		}
 	}
 
-	// Optional sort (default true): by url (3), date (1), time (2)
+	uniq := make([][]string, 0, len(dedupeMap))
+	for _, dr := range dedupeMap {
+		uniq = append(uniq, dr.row)
+	}
+
 	if s.SortOutput {
 		sort.Slice(uniq, func(i, j int) bool {
 			ui, uj := uniq[i], uniq[j]
-			if ui[3] != uj[3] {
-				return ui[3] < uj[3]
+			if ui[idxURL] != uj[idxURL] {
+				return ui[idxURL] < uj[idxURL]
 			}
-			if ui[1] != uj[1] {
-				return ui[1] < uj[1]
-			}
-			return ui[2] < uj[2]
+			ii, _ := strconv.ParseInt(ui[idxIndex], 10, 64)
+			ij, _ := strconv.ParseInt(uj[idxIndex], 10, 64)
+			return ii < ij
 		})
 	}
 
@@ -847,7 +928,6 @@ func cleanCSV(path string, s Settings) error {
 }
 
 func cleanParquet(outputPath string, s Settings) error {
-	// Open parquet file for reading
 	f, err := os.Open(outputPath)
 	if err != nil {
 		return err
@@ -857,18 +937,15 @@ func cleanParquet(outputPath string, s Settings) error {
 	reader := parquet.NewGenericReader[ParquetRow](f)
 	dedupe := make(map[string]ParquetRow)
 
-	// Read in batches
 	const batchSize = 10_000
 	for {
 		rows := make([]ParquetRow, batchSize)
 		n, err := reader.Read(rows)
 		if n > 0 {
 			for _, row := range rows[:n] {
-				// Validate timestamp
 				if row.Timestamp.IsZero() {
 					continue
 				}
-				// Dedupe key (same as CSV)
 				key := strings.Join([]string{
 					row.ResponseType,
 					row.Date,
@@ -876,6 +953,12 @@ func cleanParquet(outputPath string, s Settings) error {
 					row.URL,
 					row.Reason,
 				}, "\n")
+
+				if existing, ok := dedupe[key]; ok {
+					if row.Index >= existing.Index {
+						continue
+					}
+				}
 				dedupe[key] = row
 			}
 		}
@@ -889,7 +972,6 @@ func cleanParquet(outputPath string, s Settings) error {
 	}
 	_ = reader.Close()
 
-	// Prepare to write cleaned file to temp, then replace
 	tmpPath := outputPath + ".tmp"
 	out, err := os.Create(tmpPath)
 	if err != nil {
@@ -898,26 +980,21 @@ func cleanParquet(outputPath string, s Settings) error {
 	defer out.Close()
 
 	writer := parquet.NewGenericWriter[ParquetRow](out, parquet.Compression(&zstd.Codec{}))
-	// Convert map → slice
+
 	cleanedRows := make([]ParquetRow, 0, len(dedupe))
 	for _, r := range dedupe {
 		cleanedRows = append(cleanedRows, r)
 	}
 
-	// Optional sort (default true)
 	if s.SortOutput {
 		sort.Slice(cleanedRows, func(i, j int) bool {
 			if cleanedRows[i].URL != cleanedRows[j].URL {
 				return cleanedRows[i].URL < cleanedRows[j].URL
 			}
-			if cleanedRows[i].Date != cleanedRows[j].Date {
-				return cleanedRows[i].Date < cleanedRows[j].Date
-			}
-			return cleanedRows[i].Time < cleanedRows[j].Time
+			return cleanedRows[i].Index < cleanedRows[j].Index
 		})
 	}
 
-	// Write in chunks
 	for len(cleanedRows) > 0 {
 		chunk := cleanedRows
 		if len(chunk) > 10_000 {
@@ -934,11 +1011,7 @@ func cleanParquet(outputPath string, s Settings) error {
 		return err
 	}
 
-	// Replace original file with cleaned file
-	if err := os.Rename(tmpPath, outputPath); err != nil {
-		return err
-	}
-	return nil
+	return os.Rename(tmpPath, outputPath)
 }
 
 // ==============================
@@ -1016,7 +1089,7 @@ func abs(f float64) float64 {
 	return f
 }
 
-var spinnerChars = []rune{'-', '/', '-', '\\'} // ASCII-safe spinner
+var spinnerChars = []rune{'-', '/', '-', '\\'}
 
 func spinner(i int) rune {
 	return spinnerChars[i%len(spinnerChars)]
