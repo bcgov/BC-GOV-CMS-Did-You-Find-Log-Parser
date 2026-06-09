@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"container/heap"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -22,36 +23,44 @@ import (
 
 const (
 	ConfigFile         = "config.ini"
-	ProcessedLogsFile  = "processed_logs.txt"
-	DefaultChunkSize   = 100000
+	DefaultChunkSize   = 100_000
 	TimestampLayout    = "2006-01-02 15:04:05"
 	LogFilenamePattern = `^\d{4}-\d{2}\.log$`
 )
 
+// ProcessImmediatelyAfterSetup controls what happens when config.ini is created
+// for the first time.
+//
+//	false — pause after setup and exit; user reviews config.ini then runs again
+//	true  — proceed directly to processing after setup with no pause
+const ProcessImmediatelyAfterSetup = true
+
 // ==============================
-// Settings / Models
+// Models
 // ==============================
 
 type Settings struct {
 	LogDir         string
 	OutputDir      string
-	WhiteList      [][]string // OR of AND groups: [[a,b],[c,d]] = (a AND b) OR (c AND d)
-	BlackList      [][]string
-	ProcessingMode string
-	CleanAfter     bool
+	ProcessingMode string // "append" | "overwrite"
 	ChunkSize      int
 	LogLevel       string
 	ErrorFile      string
-	OutputFileName string
-	OutputFormat   string
-	// Behavior toggles
-	ReconcileReason         bool
-	IncludeReasonRows       bool
-	ReasonLinkWindowSeconds int
-	SearchScope             string // "url" | "full_line"
-	SearchMode              string // "substring" | "word" | "regex"
-	SortOutput              bool
-	IncludeFileLineRef      bool
+
+	WhiteList   [][]string
+	BlackList   [][]string
+	SearchScope string // "url" | "full_line"
+	SearchMode  string // "substring" | "word" | "regex"
+
+	OutputFileName     string
+	OutputFormat       string
+	SortOutput         bool
+	IncludeFileLineRef bool
+
+	MergeMatchedReasonLines  bool
+	KeepUnmatchedReasonLines bool
+	KeepIFSRows              bool
+	ReasonLinkWindowSeconds  int
 }
 
 type Entry struct {
@@ -79,6 +88,13 @@ type ParquetRow struct {
 	LineNumber   int64     `parquet:"line_number"`
 }
 
+type Stats struct {
+	Written    int64
+	Filtered   int64
+	Malformed  int64
+	Duplicates int64
+}
+
 var validResponseTypes = map[string]bool{
 	"Reason": true, "Yes": true, "No": true, "IFS": true,
 }
@@ -92,14 +108,16 @@ var validReasons = map[string]bool{
 // ==============================
 
 func main() {
-	ensureConfig()
+	if ensureConfig() && !ProcessImmediatelyAfterSetup {
+		return
+	}
 	settings, err := loadConfig()
 	if err != nil {
 		fmt.Println("Error loading config:", err)
 		return
 	}
 	fmt.Println("\nLoaded configuration:")
-	fmt.Printf("%+v\n", settings)
+	fmt.Printf("%+v\n\n", settings)
 	if err := processLogs(settings); err != nil {
 		fmt.Println("Processing error:", err)
 	}
@@ -109,82 +127,127 @@ func main() {
 // Config
 // ==============================
 
-func ensureConfig() {
+// ensureConfig creates config.ini interactively if it does not exist.
+// Returns true when a new config was written — caller should exit so the
+// user can review before the first run.
+func ensureConfig() bool {
 	if _, err := os.Stat(ConfigFile); errors.Is(err, os.ErrNotExist) {
 		fmt.Println("No config.ini found. Let's set up your configuration.")
 		reader := bufio.NewReader(os.Stdin)
 
-		fmt.Print("Enter the folder where log files are located (default: logs): ")
+		fmt.Print("Log file directory (default: logs): ")
 		logDirInput, _ := reader.ReadString('\n')
 		logDir := strings.TrimSpace(logDirInput)
 		if logDir == "" {
 			logDir = "logs"
 		}
 
-		fmt.Print("Enter the folder where processed output should be saved (default: output): ")
+		fmt.Print("Output directory (default: output): ")
 		outDirInput, _ := reader.ReadString('\n')
 		outDir := strings.TrimSpace(outDirInput)
 		if outDir == "" {
 			outDir = "output"
 		}
 
-		fmt.Print("Enter comma-separated white list terms (leave blank for none): ")
+		fmt.Print("White list terms — leave blank to include all URLs: ")
 		whiteInput, _ := reader.ReadString('\n')
 		white := strings.TrimSpace(whiteInput)
 
-		content := fmt.Sprintf(`# Configuration file for Did-You-Find log processing
+		content := fmt.Sprintf(`# Did-You-Find Log Processor — Configuration
+# Review [Paths] and [Filters] before your first run.
+
 [Paths]
+; Where log files are located
 log_file_archive = %s
+
+; Where output files are saved
 output_directory = %s
 
-[Processing]
-; white_list: URL must satisfy at least one group (leave blank to include all URLs)
-; black_list: URL is excluded if it satisfies any group (leave blank to exclude nothing)
-;
-; Syntax: use AND within a group, OR between groups, parentheses to define groups clearly.
-;   Single term:      white_list = taxes
-;   AND group:        white_list = (taxes AND /gov/content/taxes)
-;   Multiple groups:  white_list = (taxes AND /gov/content/taxes) OR (transportation AND cars)
-;   Black list:       black_list = (/test/) OR (/staging/)
+; append: only process new log files each run
+; overwrite: reprocess all log files from scratch
+processing_mode = append
+
+[Filters]
+; URL must match at least one group to be included (leave blank = include all URLs)
+; Single term:   white_list = taxes
+; AND group:     white_list = (taxes AND /gov/content/taxes)
+; Multiple OR:   white_list = (taxes AND /content/taxes) OR (transportation AND cars)
 white_list = %s
+
+; URL is excluded if it matches any group (leave blank = exclude nothing)
+; Example: black_list = (/test/) OR (/staging/)
 black_list =
-clean_after = True
-chunk_size = 100000
-log_level = Info
-error_log_file = error_log.txt
 
-; Behavior toggles
-reconcile_reason = False
-include_reason_rows = True
-reason_link_window_seconds = 60
-
-; Search behavior (applies to both white_list and black_list)
-; search_scope: "url" matches only the URL; "full_line" matches the entire log line
-; search_mode:  "substring" | "word" | "regex"
+; url: match only the URL field    full_line: match the entire log line
 search_scope = url
+
+; substring (default)    word (whole words only)    regex
 search_mode = substring
-
-; Sorting: False preserves original sequence; True sorts by url then index
-sort_output = False
-
-; Optional source references in output (CSV adds columns only when true; Parquet always has columns)
-include_file_line_ref = False
 
 [Output]
 output_file_name = Did-You-Find-Log
 output_format = csv
+
+; True sorts by URL then timestamp — requires all log files to be reprocessed each run
+; False preserves original log order and supports incremental (append) processing
+sort_output = True
+
+; Add source file name and line number columns to output
+include_file_line_ref = False
+
+[Behavior]
+; Attach a Reason row to its preceding No response within the time window below
+merge_matched_reason_lines = True
+
+; Keep Reason rows that could not be matched to a No response
+; Tip: set merge_matched_reason_lines = False and keep_unmatched_reason_lines = True
+;      to preserve the original one-row-per-log-entry structure
+keep_unmatched_reason_lines = True
+
+; IFS ("Internal Forms Service?") rows
+keep_ifs_rows = False
+
+; Maximum seconds between a No and its Reason to be treated as related
+reason_link_window_seconds = 60
+
+[Advanced]
+; Rows held in memory before writing a temporary sort file
+chunk_size = 100000
+
+; Info or Debug
+log_level = Info
+
+; Malformed and rejected lines are written here (saved to output_directory)
+error_log_file = error_log.txt
 `, logDir, outDir, white)
 
-		err := os.WriteFile(ConfigFile, []byte(content), 0644)
-		if err != nil {
+		if err := os.WriteFile(ConfigFile, []byte(content), 0644); err != nil {
 			fmt.Println("Error creating config.ini:", err)
-			return
+			return true
 		}
-		fmt.Println("\nConfig file created: config.ini")
-		fmt.Println("Please review and customize other settings if needed.")
-	} else {
-		fmt.Println("Config file found:", ConfigFile)
+		fmt.Println("\nconfig.ini created.")
+		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		if ProcessImmediatelyAfterSetup {
+			fmt.Println("Proceeding with default settings.")
+			fmt.Println("Edit config.ini to adjust settings for future runs.")
+			fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		} else {
+			fmt.Println("Setup complete — no files were processed.")
+			fmt.Println()
+			fmt.Println("Before your first run, review config.ini:")
+			fmt.Println("  1. [Filters]  — set white_list to the URLs you care about")
+			fmt.Println("  2. [Behavior] — choose how Reason rows are handled")
+			fmt.Println("  3. [Paths]    — confirm log_file_archive and output_directory")
+			fmt.Println()
+			fmt.Println("Run this tool again when ready.")
+			fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+			fmt.Println("\nPress Enter to exit.")
+			fmt.Scanln()
+		}
+		return true
 	}
+	fmt.Println("Config file found:", ConfigFile)
+	return false
 }
 
 func loadConfig() (Settings, error) {
@@ -195,17 +258,21 @@ func loadConfig() (Settings, error) {
 	lines := strings.Split(string(raw), "\n")
 	get := func(key string) string {
 		for _, line := range lines {
-			if strings.HasPrefix(strings.TrimSpace(line), key+" =") {
-				return strings.TrimSpace(strings.SplitN(line, "=", 2)[1])
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" || trimmed[0] == ';' || trimmed[0] == '#' || trimmed[0] == '[' {
+				continue
+			}
+			if strings.HasPrefix(trimmed, key+" =") || strings.HasPrefix(trimmed, key+"=") {
+				parts := strings.SplitN(trimmed, "=", 2)
+				if len(parts) == 2 {
+					return strings.TrimSpace(parts[1])
+				}
 			}
 		}
 		return ""
 	}
-	chunk, _ := strconv.Atoi(defaultIfEmpty(get("chunk_size"), "100000"))
-	clean := strings.ToLower(get("clean_after")) == "true"
 
-	reconcile := strings.ToLower(get("reconcile_reason")) == "true"
-	includeReason := strings.ToLower(get("include_reason_rows")) != "false"
+	chunk, _ := strconv.Atoi(defaultIfEmpty(get("chunk_size"), "100000"))
 	linkWindow, _ := strconv.Atoi(defaultIfEmpty(get("reason_link_window_seconds"), "60"))
 
 	searchScope := strings.ToLower(defaultIfEmpty(get("search_scope"), "url"))
@@ -217,28 +284,30 @@ func loadConfig() (Settings, error) {
 		searchMode = "substring"
 	}
 
-	sortOutput := strings.ToLower(defaultIfEmpty(get("sort_output"), "false")) == "true"
-	includeFileLineRef := strings.ToLower(defaultIfEmpty(get("include_file_line_ref"), "false")) == "true"
+	processingMode := strings.ToLower(defaultIfEmpty(get("processing_mode"), "append"))
+	if processingMode != "append" && processingMode != "overwrite" {
+		processingMode = "append"
+	}
 
 	return Settings{
-		LogDir:                  get("log_file_archive"),
-		OutputDir:               get("output_directory"),
-		WhiteList:               parseFilterExpression(get("white_list")),
-		BlackList:               parseFilterExpression(get("black_list")),
-		ProcessingMode:          strings.ToLower(get("processing_mode")),
-		CleanAfter:              clean,
-		ChunkSize:               chunk,
-		LogLevel:                get("log_level"),
-		ErrorFile:               get("error_log_file"),
-		OutputFileName:          get("output_file_name"),
-		OutputFormat:            strings.ToLower(get("output_format")),
-		ReconcileReason:         reconcile,
-		IncludeReasonRows:       includeReason,
-		ReasonLinkWindowSeconds: linkWindow,
-		SearchScope:             searchScope,
-		SearchMode:              searchMode,
-		SortOutput:              sortOutput,
-		IncludeFileLineRef:      includeFileLineRef,
+		LogDir:                   get("log_file_archive"),
+		OutputDir:                get("output_directory"),
+		ProcessingMode:           processingMode,
+		ChunkSize:                chunk,
+		LogLevel:                 get("log_level"),
+		ErrorFile:                defaultIfEmpty(get("error_log_file"), "error_log.txt"),
+		WhiteList:                parseFilterExpression(get("white_list")),
+		BlackList:                parseFilterExpression(get("black_list")),
+		SearchScope:              searchScope,
+		SearchMode:               searchMode,
+		OutputFileName:           defaultIfEmpty(get("output_file_name"), "Did-You-Find-Log"),
+		OutputFormat:             strings.ToLower(defaultIfEmpty(get("output_format"), "csv")),
+		SortOutput:               strings.ToLower(defaultIfEmpty(get("sort_output"), "false")) == "true",
+		IncludeFileLineRef:       strings.ToLower(defaultIfEmpty(get("include_file_line_ref"), "false")) == "true",
+		MergeMatchedReasonLines:  strings.ToLower(get("merge_matched_reason_lines")) == "true",
+		KeepUnmatchedReasonLines: strings.ToLower(defaultIfEmpty(get("keep_unmatched_reason_lines"), "true")) != "false",
+		KeepIFSRows:              strings.ToLower(get("keep_ifs_rows")) == "true",
+		ReasonLinkWindowSeconds:  linkWindow,
 	}, nil
 }
 
@@ -285,7 +354,6 @@ func parseLine(line string) Entry {
 	return e
 }
 
-// normalizeURL returns (normalizedURL, ok, reasonIfRejected)
 func normalizeURL(raw string) (string, bool, string) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -356,10 +424,8 @@ func collapseSlashes(p string) string {
 
 type termMatcher func(entry Entry, rawLine string) bool
 
-// parseFilterExpression parses a white_list or black_list config value into OR-of-AND groups.
+// parseFilterExpression parses a white_list or black_list value into OR-of-AND groups.
 // Syntax: (term1 AND term2) OR (term3 AND term4)
-// Parentheses are optional for single terms or single groups.
-// Returns [][]string where the outer slice is OR'd and each inner slice is AND'd.
 func parseFilterExpression(s string) [][]string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -517,6 +583,25 @@ func allRegexMatch(target string, regs []*regexp.Regexp) bool {
 }
 
 // ==============================
+// Comparator + Dedupe
+// ==============================
+
+func less(a, b Entry) bool {
+	if a.URL != b.URL {
+		return a.URL < b.URL
+	}
+	return a.Timestamp.Before(b.Timestamp)
+}
+
+func entriesEqual(a, b Entry) bool {
+	return a.ResponseType == b.ResponseType &&
+		a.Date == b.Date &&
+		a.Time == b.Time &&
+		a.URL == b.URL &&
+		a.Reason == b.Reason
+}
+
+// ==============================
 // Logic
 // ==============================
 
@@ -525,29 +610,33 @@ func processLogLine(
 	prev *Entry,
 	matcher termMatcher,
 	s Settings,
-	errWriter *bufio.Writer,
+	errWriter *lazyErrWriter,
+	stats *Stats,
 ) (*Entry, *Entry) {
 	entry := parseLine(line)
 	original := strings.TrimSpace(line)
 
 	if entry.Malformed {
+		stats.Malformed++
 		if entry.Reason != "" {
-			errWriter.WriteString("URL_REJECTED (" + entry.Reason + "): " + original + "\n")
+			errWriter.writeString("URL_REJECTED (" + entry.Reason + "): " + original + "\n")
 		} else {
-			errWriter.WriteString("MALFORMED_LINE: " + original + "\n")
+			errWriter.writeString("MALFORMED_LINE: " + original + "\n")
 		}
 		return nil, prev
 	}
 
 	if !matcher(entry, line) {
+		stats.Filtered++
 		return nil, prev
 	}
 
-	if entry.ResponseType == "IFS" {
+	if !s.KeepIFSRows && entry.ResponseType == "IFS" {
+		stats.Filtered++
 		return nil, prev
 	}
 
-	if s.ReconcileReason && entry.ResponseType == "Reason" && prev != nil && !prev.Malformed {
+	if s.MergeMatchedReasonLines && entry.ResponseType == "Reason" && prev != nil && !prev.Malformed {
 		diff := entry.Timestamp.Sub(prev.Timestamp)
 		if abs(diff.Seconds()) <= float64(s.ReasonLinkWindowSeconds) && entry.URL == prev.URL {
 			if prev.ResponseType == "No" {
@@ -560,7 +649,8 @@ func processLogLine(
 		}
 	}
 
-	if entry.ResponseType == "Reason" && !s.IncludeReasonRows {
+	if entry.ResponseType == "Reason" && !s.KeepUnmatchedReasonLines {
+		stats.Filtered++
 		return nil, prev
 	}
 
@@ -568,28 +658,36 @@ func processLogLine(
 }
 
 // ==============================
-// Processing log files
+// Processing
 // ==============================
 
 func processLogs(s Settings) error {
-	_ = os.MkdirAll(s.OutputDir, 0755)
+	if err := os.MkdirAll(s.OutputDir, 0755); err != nil {
+		return fmt.Errorf("cannot create output directory: %w", err)
+	}
+
 	outputPath := filepath.Join(s.OutputDir, fmt.Sprintf("%s.%s", s.OutputFileName, s.OutputFormat))
 	errorPath := filepath.Join(s.OutputDir, s.ErrorFile)
+	processedPath := filepath.Join(s.OutputDir, "processed_logs.txt")
 
 	outputMissing := !fileExists(outputPath)
+	clearState := s.SortOutput || s.ProcessingMode == "overwrite" || outputMissing
 	var processed map[string]bool
-	var err error
-	if s.ProcessingMode == "overwrite" || outputMissing {
+	if clearState {
 		_ = os.Remove(outputPath)
-		_ = os.Remove(ProcessedLogsFile)
+		_ = os.Remove(processedPath)
 		processed = map[string]bool{}
 	} else {
-		processed = readProcessedFiles()
+		processed = readProcessedFiles(processedPath)
+	}
+
+	if s.SortOutput && s.ProcessingMode == "append" {
+		fmt.Println("Note: sort_output = True reprocesses all log files each run.")
 	}
 
 	logFiles, err := listLogFiles(s.LogDir)
 	if err != nil {
-		return err
+		return fmt.Errorf("log directory not found or unreadable (%s): %w", s.LogDir, err)
 	}
 
 	var filesToProcess []string
@@ -599,18 +697,35 @@ func processLogs(s Settings) error {
 		}
 	}
 
-	fmt.Printf("Found %d total logs; processing %d new logs.\n", len(logFiles), len(filesToProcess))
+	fmt.Printf("Found %d total log(s); processing %d new log(s).\n", len(logFiles), len(filesToProcess))
+	if len(filesToProcess) == 0 {
+		fmt.Println("Nothing to process.")
+		return nil
+	}
 
-	errFile, _ := os.Create(errorPath)
-	bufErr := bufio.NewWriter(errFile)
-	defer errFile.Close()
-
-	buffer := make([]Entry, 0, s.ChunkSize)
-	var parquetWriter *parquet.GenericWriter[ParquetRow]
+	errWriter := &lazyErrWriter{path: errorPath}
+	defer errWriter.close()
 
 	matcher := buildMatcher(s)
+	stats := &Stats{}
 
-	var nextIndex int64 = 0
+	buffer := make([]Entry, 0, s.ChunkSize)
+	var chunkFiles []string
+	var chunkIndex int
+	var nextIndex int64
+
+	var streamWriter entryWriter
+	if !s.SortOutput {
+		streamWriter, err = newStreamWriter(outputPath, s)
+		if err != nil {
+			return fmt.Errorf("opening output: %w", err)
+		}
+	}
+	defer func() {
+		if streamWriter != nil {
+			_ = streamWriter.close()
+		}
+	}()
 
 	for fi, fname := range filesToProcess {
 		fmt.Printf("Processing file %d/%d: %s\n", fi+1, len(filesToProcess), fname)
@@ -618,7 +733,7 @@ func processLogs(s Settings) error {
 		filePath := filepath.Join(s.LogDir, fname)
 		f, ferr := os.Open(filePath)
 		if ferr != nil {
-			fmt.Println("Error opening file:", ferr)
+			fmt.Println("  Error opening file:", ferr)
 			continue
 		}
 
@@ -626,16 +741,15 @@ func processLogs(s Settings) error {
 		scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
 
 		var prev *Entry
-		var prevLineNumber int64 = 0
+		var prevLineNumber int64
 		lineCount := 0
 		spinIndex := 0
 
 		for scanner.Scan() {
 			line := scanner.Text()
 			lineCount++
-			currentLineNumber := int64(lineCount)
 
-			entryToAppend, newPrev := processLogLine(line, prev, matcher, s, bufErr)
+			entryToAppend, newPrev := processLogLine(line, prev, matcher, s, errWriter, stats)
 
 			if lineCount%5000 == 0 {
 				fmt.Printf("\r[%c] %s — %d lines processed", spinner(spinIndex), fname, lineCount)
@@ -649,26 +763,36 @@ func processLogs(s Settings) error {
 					entryToAppend.FileName = fname
 					entryToAppend.LineNumber = prevLineNumber
 				}
-				buffer = append(buffer, *entryToAppend)
+				if s.SortOutput {
+					buffer = append(buffer, *entryToAppend)
+					if len(buffer) >= s.ChunkSize {
+						path, cerr := writeChunk(buffer, chunkIndex, s.OutputDir)
+						if cerr != nil {
+							_ = f.Close()
+							return cerr
+						}
+						chunkFiles = append(chunkFiles, path)
+						chunkIndex++
+						buffer = buffer[:0]
+					}
+				} else {
+					if werr := streamWriter.writeEntry(*entryToAppend); werr != nil {
+						_ = f.Close()
+						return werr
+					}
+					stats.Written++
+				}
 			}
 
 			prev = newPrev
 			if newPrev != nil {
-				prevLineNumber = currentLineNumber
+				prevLineNumber = int64(lineCount)
 			} else {
 				prevLineNumber = 0
 			}
-
-			if len(buffer) >= s.ChunkSize {
-				parquetWriter, err = flushBuffer(buffer, s, outputPath, parquetWriter)
-				if err != nil {
-					_ = f.Close()
-					return err
-				}
-				buffer = buffer[:0]
-			}
 		}
 
+		// flush the held prev entry at end of file
 		if prev != nil {
 			prev.Index = nextIndex
 			nextIndex++
@@ -676,342 +800,400 @@ func processLogs(s Settings) error {
 				prev.FileName = fname
 				prev.LineNumber = prevLineNumber
 			}
-			buffer = append(buffer, *prev)
+			if s.SortOutput {
+				buffer = append(buffer, *prev)
+			} else {
+				if werr := streamWriter.writeEntry(*prev); werr != nil {
+					_ = f.Close()
+					return werr
+				}
+				stats.Written++
+			}
 		}
 
 		fmt.Printf("\r[✓] %s — %d lines processed\n", fname, lineCount)
-
 		_ = f.Close()
-		appendProcessedFile(fname)
-	}
 
-	if len(buffer) > 0 {
-		parquetWriter, err = flushBuffer(buffer, s, outputPath, parquetWriter)
-		if err != nil {
-			return err
+		if !s.SortOutput {
+			appendProcessedFile(processedPath, fname)
 		}
 	}
 
-	if parquetWriter != nil {
-		if err := parquetWriter.Close(); err != nil {
-			fmt.Println("Error closing parquet writer:", err)
+	if s.SortOutput {
+		if len(buffer) > 0 {
+			path, cerr := writeChunk(buffer, chunkIndex, s.OutputDir)
+			if cerr != nil {
+				return cerr
+			}
+			chunkFiles = append(chunkFiles, path)
+		}
+		if len(chunkFiles) > 0 {
+			if merr := mergeChunks(chunkFiles, s, outputPath, stats); merr != nil {
+				return merr
+			}
+		}
+		// mark all files processed only after a successful merge
+		for _, fname := range filesToProcess {
+			appendProcessedFile(processedPath, fname)
 		}
 	}
 
-	_ = bufErr.Flush()
-	fmt.Println("Processing complete.")
-
-	if s.CleanAfter {
-		cleanOutput(outputPath, s.OutputFormat, s)
+	fmt.Printf("\nProcessing complete.\n")
+	fmt.Printf("  Written:   %d\n", stats.Written)
+	fmt.Printf("  Filtered:  %d\n", stats.Filtered)
+	fmt.Printf("  Malformed: %d\n", stats.Malformed)
+	if s.SortOutput {
+		fmt.Printf("  Duplicates removed: %d\n", stats.Duplicates)
 	}
 	return nil
 }
 
 // ==============================
-// Buffer writer
+// Chunk writing
 // ==============================
 
-func flushBuffer(
-	buffer []Entry,
-	s Settings,
-	outputFile string,
-	gw *parquet.GenericWriter[ParquetRow],
-) (*parquet.GenericWriter[ParquetRow], error) {
-	switch s.OutputFormat {
-	case "csv":
-		return writeCSV(buffer, s, outputFile)
-	case "parquet":
-		return writeParquet(buffer, s, outputFile, gw)
-	default:
-		fmt.Println("Unknown output format:", s.OutputFormat, "— defaulting to CSV")
-		return writeCSV(buffer, s, outputFile)
+func writeChunk(buffer []Entry, chunkIndex int, dir string) (string, error) {
+	sort.Slice(buffer, func(i, j int) bool {
+		return less(buffer[i], buffer[j])
+	})
+	path := filepath.Join(dir, fmt.Sprintf("chunk_%04d.tmp", chunkIndex))
+	f, err := os.Create(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	w := csv.NewWriter(f)
+	for _, e := range buffer {
+		if err := w.Write(entryToChunkRow(e)); err != nil {
+			return "", err
+		}
+	}
+	w.Flush()
+	return path, w.Error()
+}
+
+func entryToChunkRow(e Entry) []string {
+	return []string{
+		e.ResponseType,
+		e.Date,
+		e.Time,
+		e.URL,
+		e.Reason,
+		e.Timestamp.Format(time.RFC3339Nano),
+		strconv.FormatInt(e.Index, 10),
+		e.FileName,
+		strconv.FormatInt(e.LineNumber, 10),
 	}
 }
 
+func chunkRowToEntry(row []string) (Entry, error) {
+	if len(row) < 9 {
+		return Entry{}, fmt.Errorf("short chunk row: %d fields", len(row))
+	}
+	ts, err := time.Parse(time.RFC3339Nano, row[5])
+	if err != nil {
+		return Entry{}, fmt.Errorf("bad timestamp in chunk: %w", err)
+	}
+	idx, _ := strconv.ParseInt(row[6], 10, 64)
+	ln, _ := strconv.ParseInt(row[8], 10, 64)
+	return Entry{
+		ResponseType: row[0],
+		Date:         row[1],
+		Time:         row[2],
+		URL:          row[3],
+		Reason:       row[4],
+		Timestamp:    ts,
+		Index:        idx,
+		FileName:     row[7],
+		LineNumber:   ln,
+	}, nil
+}
+
 // ==============================
-// CSV output
+// Heap merge
 // ==============================
 
-func writeCSV(buffer []Entry, s Settings, outputPath string) (*parquet.GenericWriter[ParquetRow], error) {
-	exists := fileExists(outputPath)
+type heapItem struct {
+	entry  Entry
+	reader *csv.Reader
+}
 
-	f, err := os.OpenFile(outputPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+type chunkHeap []*heapItem
+
+func (h chunkHeap) Len() int            { return len(h) }
+func (h chunkHeap) Less(i, j int) bool  { return less(h[i].entry, h[j].entry) }
+func (h chunkHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *chunkHeap) Push(x interface{}) { *h = append(*h, x.(*heapItem)) }
+func (h *chunkHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	old[n-1] = nil
+	*h = old[:n-1]
+	return x
+}
+
+func mergeChunks(chunkFiles []string, s Settings, outputPath string, stats *Stats) error {
+	var openFiles []*os.File
+	defer func() {
+		for _, f := range openFiles {
+			_ = f.Close()
+		}
+		for _, path := range chunkFiles {
+			_ = os.Remove(path)
+		}
+	}()
+
+	h := &chunkHeap{}
+	heap.Init(h)
+
+	for _, path := range chunkFiles {
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		openFiles = append(openFiles, f)
+		r := csv.NewReader(f)
+		row, err := r.Read()
+		if errors.Is(err, io.EOF) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		e, err := chunkRowToEntry(row)
+		if err != nil {
+			return err
+		}
+		heap.Push(h, &heapItem{entry: e, reader: r})
+	}
+
+	writer, err := newMergeWriter(outputPath, s)
+	if err != nil {
+		return err
+	}
+
+	var prev *Entry
+	var mergeErr error
+	for h.Len() > 0 {
+		item := heap.Pop(h).(*heapItem)
+		e := item.entry
+
+		if prev == nil || !entriesEqual(*prev, e) {
+			if werr := writer.writeEntry(e); werr != nil {
+				mergeErr = werr
+				break
+			}
+			stats.Written++
+			eCopy := e
+			prev = &eCopy
+		} else {
+			stats.Duplicates++
+		}
+
+		row, rerr := item.reader.Read()
+		if errors.Is(rerr, io.EOF) {
+			continue
+		}
+		if rerr != nil {
+			mergeErr = rerr
+			break
+		}
+		next, nerr := chunkRowToEntry(row)
+		if nerr != nil {
+			mergeErr = nerr
+			break
+		}
+		item.entry = next
+		heap.Push(h, item)
+	}
+
+	if mergeErr != nil {
+		_ = writer.close()
+		_ = os.Remove(outputPath)
+		return mergeErr
+	}
+	return writer.close()
+}
+
+// ==============================
+// Output writers
+// ==============================
+
+type entryWriter interface {
+	writeEntry(e Entry) error
+	close() error
+}
+
+// — CSV —
+
+type csvEntryWriter struct {
+	f *os.File
+	w *csv.Writer
+	s Settings
+}
+
+func newCSVEntryWriter(path string, s Settings) (*csvEntryWriter, error) {
+	f, err := os.Create(path)
 	if err != nil {
 		return nil, err
 	}
 	w := csv.NewWriter(f)
-
-	if !exists {
-		base := []string{"response_type", "date", "time", "url", "reason", "timestamp", "index"}
-		if s.IncludeFileLineRef {
-			base = append(base, "file_name", "line_number")
-		}
-		_ = w.Write(base)
-	}
-
-	for _, e := range buffer {
-		row := []string{
-			e.ResponseType,
-			e.Date,
-			e.Time,
-			e.URL,
-			e.Reason,
-			e.Timestamp.Format(time.RFC3339Nano),
-			strconv.FormatInt(e.Index, 10),
-		}
-		if s.IncludeFileLineRef {
-			row = append(row, e.FileName, strconv.FormatInt(e.LineNumber, 10))
-		}
-		_ = w.Write(row)
-	}
-
-	w.Flush()
-	if err := w.Error(); err != nil {
+	if err := w.Write(csvHeader(s)); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
-	_ = f.Close()
-	return nil, nil
+	return &csvEntryWriter{f: f, w: w, s: s}, nil
 }
 
-// ==============================
-// Parquet output
-// ==============================
-
-func writeParquet(
-	buffer []Entry,
-	s Settings,
-	outputPath string,
-	gw *parquet.GenericWriter[ParquetRow],
-) (*parquet.GenericWriter[ParquetRow], error) {
-	if gw == nil {
-		f, err := os.Create(outputPath)
-		if err != nil {
+func newCSVStreamWriter(path string, s Settings) (*csvEntryWriter, error) {
+	exists := fileExists(path)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	w := csv.NewWriter(f)
+	if !exists {
+		if err := w.Write(csvHeader(s)); err != nil {
+			_ = f.Close()
 			return nil, err
 		}
-		gw = parquet.NewGenericWriter[ParquetRow](f, parquet.Compression(&zstd.Codec{}))
+		w.Flush()
 	}
-
-	rows := make([]ParquetRow, 0, len(buffer))
-	for _, e := range buffer {
-		row := ParquetRow{
-			ResponseType: e.ResponseType,
-			Date:         e.Date,
-			Time:         e.Time,
-			URL:          e.URL,
-			Reason:       e.Reason,
-			Timestamp:    e.Timestamp,
-			Index:        e.Index,
-		}
-		if s.IncludeFileLineRef {
-			row.FileName = e.FileName
-			row.LineNumber = e.LineNumber
-		}
-		rows = append(rows, row)
-	}
-	if _, err := gw.Write(rows); err != nil {
-		return gw, err
-	}
-	return gw, nil
+	return &csvEntryWriter{f: f, w: w, s: s}, nil
 }
 
-// ==============================
-// Clean output (dedupe, optional sort)
-// ==============================
-
-func cleanOutput(outputPath, format string, s Settings) {
-	fmt.Println("Cleaning final output... (dedupe + timestamp validation)")
-	switch format {
-	case "csv":
-		if err := cleanCSV(outputPath, s); err != nil {
-			fmt.Println("Error cleaning csv:", err)
-		}
-	case "parquet":
-		fmt.Println("Cleaning parquet output...")
-		if err := cleanParquet(outputPath, s); err != nil {
-			fmt.Println("Error cleaning parquet:", err)
-		}
-	default:
-		fmt.Println("Unknown output format:", format)
+func csvHeader(s Settings) []string {
+	h := []string{"response_type", "date", "time", "url", "reason", "timestamp", "index"}
+	if s.IncludeFileLineRef {
+		h = append(h, "file_name", "line_number")
 	}
+	return h
 }
 
-func cleanCSV(path string, s Settings) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
+func (c *csvEntryWriter) writeEntry(e Entry) error {
+	row := []string{
+		e.ResponseType, e.Date, e.Time, e.URL, e.Reason,
+		e.Timestamp.Format(time.RFC3339Nano),
+		strconv.FormatInt(e.Index, 10),
 	}
-	defer f.Close()
+	if c.s.IncludeFileLineRef {
+		row = append(row, e.FileName, strconv.FormatInt(e.LineNumber, 10))
+	}
+	return c.w.Write(row)
+}
 
-	r := csv.NewReader(f)
-	rows, err := r.ReadAll()
-	if err != nil {
+func (c *csvEntryWriter) close() error {
+	c.w.Flush()
+	if err := c.w.Error(); err != nil {
+		_ = c.f.Close()
 		return err
 	}
-	if len(rows) < 2 {
+	return c.f.Close()
+}
+
+// — Parquet —
+
+type parquetEntryWriter struct {
+	f     *os.File
+	w     *parquet.GenericWriter[ParquetRow]
+	s     Settings
+	batch []ParquetRow
+}
+
+func newParquetEntryWriter(path string, s Settings) (*parquetEntryWriter, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	w := parquet.NewGenericWriter[ParquetRow](f, parquet.Compression(&zstd.Codec{}))
+	return &parquetEntryWriter{f: f, w: w, s: s}, nil
+}
+
+func (p *parquetEntryWriter) writeEntry(e Entry) error {
+	row := ParquetRow{
+		ResponseType: e.ResponseType, Date: e.Date, Time: e.Time,
+		URL: e.URL, Reason: e.Reason, Timestamp: e.Timestamp, Index: e.Index,
+	}
+	if p.s.IncludeFileLineRef {
+		row.FileName = e.FileName
+		row.LineNumber = e.LineNumber
+	}
+	p.batch = append(p.batch, row)
+	if len(p.batch) >= 10_000 {
+		return p.flush()
+	}
+	return nil
+}
+
+func (p *parquetEntryWriter) flush() error {
+	if len(p.batch) == 0 {
 		return nil
 	}
-
-	header := rows[0]
-	data := rows[1:]
-
-	hIdx := map[string]int{}
-	for i, name := range header {
-		hIdx[strings.ToLower(strings.TrimSpace(name))] = i
-	}
-	idxRT, ok1 := hIdx["response_type"]
-	idxDate, ok2 := hIdx["date"]
-	idxTime, ok3 := hIdx["time"]
-	idxURL, ok4 := hIdx["url"]
-	idxReason, ok5 := hIdx["reason"]
-	idxIndex, ok7 := hIdx["index"]
-
-	if !(ok1 && ok2 && ok3 && ok4 && ok5 && ok7) {
-		return fmt.Errorf("missing required columns in CSV header")
-	}
-
-	// Dedupe on (response_type, date, time, url, reason) — keep the lowest index
-	type dedupedRow struct {
-		row []string
-		idx int64
-	}
-	dedupeMap := make(map[string]dedupedRow, len(data))
-
-	for _, row := range data {
-		if len(row) <= idxIndex {
-			continue
-		}
-		key := strings.Join([]string{
-			row[idxRT], row[idxDate], row[idxTime], row[idxURL], row[idxReason],
-		}, "\n")
-
-		idxVal, err := strconv.ParseInt(row[idxIndex], 10, 64)
-		if err != nil {
-			continue
-		}
-
-		if existing, ok := dedupeMap[key]; !ok || idxVal < existing.idx {
-			dedupeMap[key] = dedupedRow{row: row, idx: idxVal}
-		}
-	}
-
-	uniq := make([][]string, 0, len(dedupeMap))
-	for _, dr := range dedupeMap {
-		uniq = append(uniq, dr.row)
-	}
-
-	if s.SortOutput {
-		sort.Slice(uniq, func(i, j int) bool {
-			ui, uj := uniq[i], uniq[j]
-			if ui[idxURL] != uj[idxURL] {
-				return ui[idxURL] < uj[idxURL]
-			}
-			ii, _ := strconv.ParseInt(ui[idxIndex], 10, 64)
-			ij, _ := strconv.ParseInt(uj[idxIndex], 10, 64)
-			return ii < ij
-		})
-	}
-
-	wf, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer wf.Close()
-
-	w := csv.NewWriter(wf)
-	if err := w.Write(header); err != nil {
-		return err
-	}
-	w.WriteAll(uniq)
-	w.Flush()
-	return w.Error()
+	_, err := p.w.Write(p.batch)
+	p.batch = p.batch[:0]
+	return err
 }
 
-func cleanParquet(outputPath string, s Settings) error {
-	f, err := os.Open(outputPath)
-	if err != nil {
+func (p *parquetEntryWriter) close() error {
+	if err := p.flush(); err != nil {
+		_ = p.w.Close()
+		_ = p.f.Close()
 		return err
 	}
-	defer f.Close()
+	if err := p.w.Close(); err != nil {
+		_ = p.f.Close()
+		return err
+	}
+	return p.f.Close()
+}
 
-	reader := parquet.NewGenericReader[ParquetRow](f)
-	dedupe := make(map[string]ParquetRow)
+// — Routing —
 
-	const batchSize = 10_000
-	for {
-		rows := make([]ParquetRow, batchSize)
-		n, err := reader.Read(rows)
-		if n > 0 {
-			for _, row := range rows[:n] {
-				if row.Timestamp.IsZero() {
-					continue
-				}
-				key := strings.Join([]string{
-					row.ResponseType,
-					row.Date,
-					row.Time,
-					row.URL,
-					row.Reason,
-				}, "\n")
+func newMergeWriter(path string, s Settings) (entryWriter, error) {
+	if s.OutputFormat == "parquet" {
+		return newParquetEntryWriter(path, s)
+	}
+	return newCSVEntryWriter(path, s)
+}
 
-				if existing, ok := dedupe[key]; ok {
-					if row.Index >= existing.Index {
-						continue
-					}
-				}
-				dedupe[key] = row
-			}
+func newStreamWriter(path string, s Settings) (entryWriter, error) {
+	if s.OutputFormat == "parquet" {
+		if fileExists(path) {
+			fmt.Println("Note: Parquet output does not support append — existing file will be overwritten.")
 		}
-		if errors.Is(err, io.EOF) {
-			break
-		}
+		return newParquetEntryWriter(path, s)
+	}
+	return newCSVStreamWriter(path, s)
+}
+
+// ==============================
+// Lazy error writer
+// ==============================
+
+type lazyErrWriter struct {
+	path string
+	f    *os.File
+	w    *bufio.Writer
+}
+
+func (l *lazyErrWriter) writeString(s string) {
+	if l.f == nil {
+		f, err := os.Create(l.path)
 		if err != nil {
-			_ = reader.Close()
-			return err
+			return
 		}
+		l.f = f
+		l.w = bufio.NewWriter(f)
 	}
-	_ = reader.Close()
+	_, _ = l.w.WriteString(s)
+}
 
-	tmpPath := outputPath + ".tmp"
-	out, err := os.Create(tmpPath)
-	if err != nil {
-		return err
+func (l *lazyErrWriter) close() {
+	if l.f != nil {
+		_ = l.w.Flush()
+		_ = l.f.Close()
 	}
-	defer out.Close()
-
-	writer := parquet.NewGenericWriter[ParquetRow](out, parquet.Compression(&zstd.Codec{}))
-
-	cleanedRows := make([]ParquetRow, 0, len(dedupe))
-	for _, r := range dedupe {
-		cleanedRows = append(cleanedRows, r)
-	}
-
-	if s.SortOutput {
-		sort.Slice(cleanedRows, func(i, j int) bool {
-			if cleanedRows[i].URL != cleanedRows[j].URL {
-				return cleanedRows[i].URL < cleanedRows[j].URL
-			}
-			return cleanedRows[i].Index < cleanedRows[j].Index
-		})
-	}
-
-	for len(cleanedRows) > 0 {
-		chunk := cleanedRows
-		if len(chunk) > 10_000 {
-			chunk = cleanedRows[:10_000]
-		}
-		if _, err := writer.Write(chunk); err != nil {
-			_ = writer.Close()
-			return err
-		}
-		cleanedRows = cleanedRows[len(chunk):]
-	}
-
-	if err := writer.Close(); err != nil {
-		return err
-	}
-
-	return os.Rename(tmpPath, outputPath)
 }
 
 // ==============================
@@ -1034,9 +1216,9 @@ func listLogFiles(dir string) ([]string, error) {
 	return files, nil
 }
 
-func readProcessedFiles() map[string]bool {
+func readProcessedFiles(path string) map[string]bool {
 	result := map[string]bool{}
-	f, err := os.ReadFile(ProcessedLogsFile)
+	f, err := os.ReadFile(path)
 	if err != nil {
 		return result
 	}
@@ -1049,25 +1231,10 @@ func readProcessedFiles() map[string]bool {
 	return result
 }
 
-func appendProcessedFile(name string) {
-	f, _ := os.OpenFile(ProcessedLogsFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+func appendProcessedFile(path, name string) {
+	f, _ := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	_, _ = f.WriteString(name + "\n")
 	_ = f.Close()
-}
-
-func splitComma(s string) []string {
-	if strings.TrimSpace(s) == "" {
-		return nil
-	}
-	parts := strings.Split(s, ",")
-	out := make([]string, 0)
-	for _, p := range parts {
-		v := strings.TrimSpace(strings.ToLower(p))
-		if v != "" {
-			out = append(out, v)
-		}
-	}
-	return out
 }
 
 func defaultIfEmpty(v, def string) string {
@@ -1089,7 +1256,7 @@ func abs(f float64) float64 {
 	return f
 }
 
-var spinnerChars = []rune{'-', '/', '-', '\\'}
+var spinnerChars = []rune{'-', '\\', '|', '/'}
 
 func spinner(i int) rune {
 	return spinnerChars[i%len(spinnerChars)]
